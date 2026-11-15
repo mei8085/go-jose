@@ -242,6 +242,14 @@ func (parsed *rawJSONWebEncryption) sanitized(
 		}
 	}
 
+	// Reject parameters that occur in more than one header layer with
+	// differing values. This runs before any algorithm or key-selection
+	// decision so that unauthenticated unprotected or per-recipient header
+	// copies can never shadow the authenticated protected header.
+	if err := checkHeaderConflicts(obj.protected, obj.unprotected, obj.recipients); err != nil {
+		return nil, err
+	}
+
 	for i, recipient := range obj.recipients {
 		headers := obj.mergedHeaders(&recipient)
 		if headers.getAlgorithm() == "" {

@@ -17,6 +17,7 @@
 package jose
 
 import (
+	"bytes"
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/x509"
@@ -75,6 +76,17 @@ var (
 
 	// ErrUnsupportedCriticalHeader is returned when a header is marked critical but not supported by go-jose.
 	ErrUnsupportedCriticalHeader = errors.New("go-jose/go-jose: unsupported critical header")
+
+	// ErrHeaderConflict is returned when the same header parameter name is
+	// present in more than one of the JWE/JWS header sources (the protected
+	// header, the shared unprotected header, or a per-recipient header) with
+	// differing values. RFC 7516 Sections 5.1 and 5.2 require that the
+	// parameters used do not depend on which copy is picked, so conflicting
+	// duplicates are rejected instead of being silently resolved by header
+	// precedence. This keeps unauthenticated header copies from being able to
+	// shadow authenticated security decisions such as "alg", "enc", "kid" or
+	// "nonce".
+	ErrHeaderConflict = errors.New("go-jose/go-jose: conflicting header parameter values")
 
 	// errEmptyInput is returned when go-jose was asked to parse an empty string.
 	errEmptyInput = errors.New("go-jose/go-jose: empty input")
@@ -512,6 +524,85 @@ func (parsed rawHeader) merge(src *rawHeader) {
 
 		parsed[k] = v
 	}
+}
+
+// jweHeaderConflictParams are the security-relevant JWE header parameter names
+// for which duplicates across header layers must carry identical values. They
+// select cryptographic operations or key material, so letting an unauthenticated
+// copy shadow an authenticated one could downgrade or misroute decryption.
+var jweHeaderConflictParams = []HeaderKey{
+	headerAlgorithm,  // alg
+	headerEncryption, // enc
+	headerKeyID,      // kid
+	headerNonce,      // nonce
+}
+
+// checkHeaderConflicts verifies that the protected header, the shared
+// unprotected header and every per-recipient header do not carry different
+// values for the same security-relevant parameter. Per RFC 7516 Sections 5.1
+// and 5.2, header parameter names shared between layers must be identical;
+// differing values are rejected rather than resolved by merge precedence.
+//
+// A parameter is only in conflict when it appears in at least two layers that
+// apply to the same recipient with differing values. The global layers
+// (protected and shared unprotected headers) apply to every recipient, so they
+// are checked against each other and against every per-recipient header.
+// Per-recipient headers are independent of each other (two recipients can
+// legitimately use different "alg" values), so they are never compared
+// against one another. Byte-identical duplicates across layers are allowed, as
+// required by the RFC. Parameters outside jweHeaderConflictParams are not
+// checked here.
+func checkHeaderConflicts(protected, unprotected *rawHeader, recipients []recipientInfo) error {
+	global := map[HeaderKey]json.RawMessage{}
+	note := map[HeaderKey]string{}
+
+	recordGlobal := func(src string, header *rawHeader) error {
+		if header == nil {
+			return nil
+		}
+		for _, param := range jweHeaderConflictParams {
+			value, ok := (*header)[param]
+			if !ok || value == nil {
+				continue
+			}
+			if previous, ok := global[param]; ok {
+				if !bytes.Equal(previous, *value) {
+					return fmt.Errorf("%w: %q has different values in %s and %s",
+						ErrHeaderConflict, string(param), note[param], src)
+				}
+				// Identical value in another global layer is permitted.
+				continue
+			}
+			global[param] = *value
+			note[param] = src
+		}
+		return nil
+	}
+
+	if err := recordGlobal("the protected header", protected); err != nil {
+		return err
+	}
+	if err := recordGlobal("the shared unprotected header", unprotected); err != nil {
+		return err
+	}
+
+	for i := range recipients {
+		header := recipients[i].header
+		if header == nil {
+			continue
+		}
+		for _, param := range jweHeaderConflictParams {
+			value, ok := (*header)[param]
+			if !ok || value == nil {
+				continue
+			}
+			if previous, ok := global[param]; ok && !bytes.Equal(previous, *value) {
+				return fmt.Errorf("%w: %q has different values in %s and recipient %d header",
+					ErrHeaderConflict, string(param), note[param], i)
+			}
+		}
+	}
+	return nil
 }
 
 // Get JOSE name of curve
