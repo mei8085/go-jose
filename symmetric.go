@@ -52,7 +52,83 @@ const (
 	defaultP2C = 600000
 	// Default salt size: 128 bits
 	defaultP2SSize = 16
+
+	// maxP2C is the maximum PBES2 iteration count ("p2c") that a single
+	// recipient may request when decrypting. The count is chosen by the
+	// sender and therefore untrusted.
+	maxP2C = 1000000
+
+	// maxP2CPerMessage is the default total PBES2 iteration count one
+	// decryption may spend, leaving room for a few recipients at the default
+	// count while bounding a message that carries many password-based
+	// recipients. See MaxPBES2Work.
+	maxP2CPerMessage = 2 * maxP2C
 )
+
+// MaxPBES2Work is the maximum total number of PBES2 key derivation iterations
+// that decrypting one JWE may spend across all of its recipients. It bounds
+// the CPU cost of a message that carries many password-based recipients, each
+// of which would otherwise pay for its own full PBKDF2 derivation.
+//
+// The budget is charged before a derivation runs, so a recipient that would
+// push the total past [MaxPBES2Work] is skipped without doing any expensive
+// work. Recipients using other key management algorithms, and PBES2 recipients
+// whose "p2c" or "p2s" headers are invalid (and are therefore rejected before
+// deriving a key), cost nothing.
+//
+// The default admits several recipients at the default iteration count while
+// still bounding a message to a small multiple of the per-recipient limit
+// ([maxP2C]). Set it to zero (or any non-positive value) to refuse all PBES2
+// key derivations. Higher values mean more potential work done across
+// untrusted input.
+//
+// If modifying MaxPBES2Work, do it before any decryption occurs.
+var MaxPBES2Work = maxP2CPerMessage
+
+// pbes2WorkBudget is the number of PBES2 iterations one decryption may still
+// spend on key derivations.
+type pbes2WorkBudget struct {
+	remaining int
+}
+
+// newPBES2WorkBudget returns a budget for a single Decrypt or DecryptMulti
+// call, initialized from [MaxPBES2Work].
+func newPBES2WorkBudget() *pbes2WorkBudget {
+	return &pbes2WorkBudget{remaining: MaxPBES2Work}
+}
+
+// spend reports whether the PBES2 key derivation that decrypter is about to
+// perform fits in the remaining budget, charging it if so. It never charges
+// work that decryptKey would reject before deriving a key, so malformed
+// headers, a missing encrypted key and unreasonably high counts stay cheap to
+// reject.
+func (b *pbes2WorkBudget) spend(decrypter keyDecrypter, headers rawHeader, recipient *recipientInfo) bool {
+	if _, ok := decrypter.(*symmetricKeyCipher); !ok {
+		// Other decrypters do not perform a PBKDF2 derivation, and an
+		// OpaqueKeyDecrypter performs work this package cannot account for.
+		return true
+	}
+	switch headers.getAlgorithm() {
+	case PBES2_HS256_A128KW, PBES2_HS384_A192KW, PBES2_HS512_A256KW:
+	default:
+		return true
+	}
+	if recipient == nil || len(recipient.encryptedKey) == 0 {
+		// decryptKey rejects this without deriving a key.
+		return true
+	}
+
+	p2c, _, err := pbes2DecryptParams(headers)
+	if err != nil {
+		// decryptKey will reject these headers without deriving a key.
+		return true
+	}
+	if p2c > b.remaining {
+		return false
+	}
+	b.remaining -= p2c
+	return true
+}
 
 // Dummy key cipher for shared symmetric key mode
 type symmetricKeyCipher struct {
@@ -364,6 +440,36 @@ func (ctx *symmetricKeyCipher) encryptKey(cek []byte, alg KeyAlgorithm) (recipie
 	return recipientInfo{}, ErrUnsupportedAlgorithm
 }
 
+// pbes2DecryptParams validates the PBES2 headers of a recipient before a key
+// derivation is attempted. It returns the iteration count and salt input, or
+// an error if the headers are missing, malformed, or demand more work than a
+// single recipient is allowed. A caller must not derive a key when it returns
+// an error.
+func pbes2DecryptParams(headers rawHeader) (int, *byteBuffer, error) {
+	p2s, err := headers.getP2S()
+	if err != nil {
+		return 0, nil, fmt.Errorf("go-jose/go-jose: invalid P2S: %v", err)
+	}
+	if p2s == nil || len(p2s.bytes()) == 0 {
+		return 0, nil, fmt.Errorf("go-jose/go-jose: invalid P2S: must be present")
+	}
+
+	p2c, err := headers.getP2C()
+	if err != nil {
+		return 0, nil, fmt.Errorf("go-jose/go-jose: invalid P2C: %v", err)
+	}
+	if p2c <= 0 {
+		return 0, nil, fmt.Errorf("go-jose/go-jose: invalid P2C: must be a positive integer")
+	}
+	if p2c > maxP2C {
+		// An unauthenticated attacker can set a high P2C value. Set an upper limit to avoid
+		// DoS attacks.
+		return 0, nil, fmt.Errorf("go-jose/go-jose: invalid P2C: too high")
+	}
+
+	return p2c, p2s, nil
+}
+
 // Decrypt the content encryption key.
 func (ctx *symmetricKeyCipher) decryptKey(headers rawHeader, recipient *recipientInfo, generator keyGenerator) ([]byte, error) {
 	if recipient == nil {
@@ -417,25 +523,9 @@ func (ctx *symmetricKeyCipher) decryptKey(headers rawHeader, recipient *recipien
 		}
 		return cek, nil
 	case PBES2_HS256_A128KW, PBES2_HS384_A192KW, PBES2_HS512_A256KW:
-		p2s, err := headers.getP2S()
+		p2c, p2s, err := pbes2DecryptParams(headers)
 		if err != nil {
-			return nil, fmt.Errorf("go-jose/go-jose: invalid P2S: %v", err)
-		}
-		if p2s == nil || len(p2s.bytes()) == 0 {
-			return nil, fmt.Errorf("go-jose/go-jose: invalid P2S: must be present")
-		}
-
-		p2c, err := headers.getP2C()
-		if err != nil {
-			return nil, fmt.Errorf("go-jose/go-jose: invalid P2C: %v", err)
-		}
-		if p2c <= 0 {
-			return nil, fmt.Errorf("go-jose/go-jose: invalid P2C: must be a positive integer")
-		}
-		if p2c > 1000000 {
-			// An unauthenticated attacker can set a high P2C value. Set an upper limit to avoid
-			// DoS attacks.
-			return nil, fmt.Errorf("go-jose/go-jose: invalid P2C: too high")
+			return nil, err
 		}
 
 		// salt is UTF8(Alg) || 0x00 || Salt Input

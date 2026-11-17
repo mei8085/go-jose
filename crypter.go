@@ -459,6 +459,11 @@ func validateContentEncryptionKeySize(cek []byte, cipher contentCipher) error {
 //
 // Automatically decompresses plaintext, but returns an error if the decompressed
 // data would be >250kB or >10x the size of the compressed data, whichever is larger.
+//
+// For a PBES2 recipient, the key derivation count ("p2c") is limited both per
+// recipient and in total by [MaxPBES2Work]; a message that would exceed the
+// work budget is rejected with [ErrPBES2WorkLimit] rather than
+// ErrCryptoFailure.
 func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) {
 	headers := obj.mergedHeaders(nil)
 
@@ -504,6 +509,11 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 	recipient := obj.recipients[0]
 	recipientHeaders := obj.mergedHeaders(&recipient)
 
+	budget := newPBES2WorkBudget()
+	if !budget.spend(decrypter, recipientHeaders, &recipient) {
+		return nil, ErrPBES2WorkLimit
+	}
+
 	cek, err := decrypter.decryptKey(recipientHeaders, &recipient, generator)
 	if err != nil {
 		return nil, ErrCryptoFailure
@@ -540,8 +550,12 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 //
 // Calling DecryptMulti() with PBES2 enabled can result in excessive CPU work.
 // The PBES2 key unwrapping algorithms are intentionally expensive, and have to
-// be run for each recipient. To be safe: don't allow PBES2 algorithms in calls
-// to ParseEncrypted / ParseEncryptedJSON. If your application requires PBES2,
+// be run for each recipient. To bound this, the total PBES2 iteration count
+// spent across the recipients of one message is limited by [MaxPBES2Work]; a
+// recipient whose derivation would exceed the remaining budget is skipped, and
+// [ErrPBES2WorkLimit] is returned if no recipient could be decrypted because
+// of the budget. To be safe: don't allow PBES2 algorithms in calls to
+// ParseEncrypted / ParseEncryptedJSON. If your application requires PBES2,
 // prefer Decrypt(), which will only process single-recipient messages.
 func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Header, []byte, error) {
 	globalHeaders := obj.mergedHeaders(nil)
@@ -584,17 +598,29 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 	index := -1
 	var plaintext []byte
 	var headers rawHeader
+	budgetSkipped := false
 
 	if len(obj.recipients) == 0 {
 		return -1, Header{}, nil, errors.New("go-jose/go-jose: no recipients")
 	}
 
-	// Loop sets `err` in the function scope; don't shadow it.
-	for i, recipient := range obj.recipients {
+	// One PBES2 work budget is shared by every recipient of this call, so a
+	// message cannot multiply the cost of a single derivation by its
+	// recipient count. A recipient whose derivation would overrun the budget
+	// is skipped without doing the expensive work; cheaper recipients (and
+	// recipients whose headers are rejected before deriving) are still tried.
+	budget := newPBES2WorkBudget()
+
+	for i := range obj.recipients {
+		recipient := obj.recipients[i]
 		recipientHeaders := obj.mergedHeaders(&recipient)
 
-		var cek []byte
-		cek, err = decrypter.decryptKey(recipientHeaders, &recipient, generator)
+		if !budget.spend(decrypter, recipientHeaders, &recipient) {
+			budgetSkipped = true
+			continue
+		}
+
+		cek, err := decrypter.decryptKey(recipientHeaders, &recipient, generator)
 		if err != nil {
 			continue
 		}
@@ -606,6 +632,7 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 		// Found a valid CEK -- let's try to decrypt.
 		plaintext, err = cipher.decrypt(cek, authData, parts)
 		if err != nil {
+			plaintext = nil
 			continue
 		}
 
@@ -614,7 +641,13 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 		break
 	}
 
-	if err != nil {
+	if index < 0 {
+		if budgetSkipped {
+			// At least one recipient was left untried because its derivation
+			// did not fit in the work budget. Report that distinctly from a
+			// wrong password, so callers can opt into a larger budget.
+			return -1, Header{}, nil, ErrPBES2WorkLimit
+		}
 		return -1, Header{}, nil, ErrCryptoFailure
 	}
 

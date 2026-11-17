@@ -76,6 +76,19 @@ var (
 	// ErrUnsupportedCriticalHeader is returned when a header is marked critical but not supported by go-jose.
 	ErrUnsupportedCriticalHeader = errors.New("go-jose/go-jose: unsupported critical header")
 
+	// ErrPBES2WorkLimit is returned when decrypting a JWE would require more
+	// PBES2 key derivation work than [MaxPBES2Work] allows. The "p2c" work
+	// factor is chosen by the sender for every recipient, so the total across
+	// a message's recipients is budgeted as well as the count for any one
+	// recipient.
+	//
+	// This error is distinct from ErrCryptoFailure: it reports that a
+	// recipient was skipped to stay within the work budget, not that the
+	// supplied password was wrong. A recipient that fits in the remaining
+	// budget is still tried, so this error is only returned when no recipient
+	// could be decrypted and at least one was skipped for cost.
+	ErrPBES2WorkLimit = errors.New("go-jose/go-jose: PBES2 work limit exceeded: cumulative p2c budget exhausted")
+
 	// errEmptyInput is returned when go-jose was asked to parse an empty string.
 	errEmptyInput = errors.New("go-jose/go-jose: empty input")
 
