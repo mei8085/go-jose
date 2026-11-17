@@ -342,7 +342,7 @@ func (ctx *genericSigner) Sign(payload []byte) (*JSONWebSignature, error) {
 
 		if b64, ok := protected[headerB64]; ok {
 			if needsBase64, ok = b64.(bool); !ok {
-				return nil, errors.New("go-jose/go-jose: Invalid b64 header parameter")
+				return nil, errInvalidB64Value
 			}
 		}
 
@@ -456,10 +456,21 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 		if err != nil {
 			return err
 		}
+
+		// Per https://www.rfc-editor.org/rfc/rfc7797.html#section-3,
+		// "b64" MUST occur only within the JWS Protected Header.
+		err = signature.header.checkNoB64()
+		if err != nil {
+			return err
+		}
 	}
 
 	if signature.protected != nil {
 		err = signature.protected.checkSupportedCritical(supportedCritical)
+		if err != nil {
+			return err
+		}
+		err = signature.protected.checkB64Value()
 		if err != nil {
 			return err
 		}
@@ -519,11 +530,22 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 			if err != nil {
 				continue
 			}
+
+			// Per https://www.rfc-editor.org/rfc/rfc7797.html#section-3,
+			// "b64" MUST occur only within the JWS Protected Header.
+			err = signature.header.checkNoB64()
+			if err != nil {
+				continue
+			}
 		}
 
 		if signature.protected != nil {
 			// Check for only supported critical headers
 			err := signature.protected.checkSupportedCritical(supportedCritical)
+			if err != nil {
+				continue
+			}
+			err = signature.protected.checkB64Value()
 			if err != nil {
 				continue
 			}

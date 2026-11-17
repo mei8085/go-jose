@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/go-jose/go-jose/v4/json"
 )
@@ -356,8 +357,49 @@ func (parsed rawHeader) checkNoCritical() error {
 	return nil
 }
 
+// checkNoB64 verifies there is no "b64" header parameter present.
+// RFC 7797 section 3 requires "b64" to occur only in the JWS Protected Header.
+func (parsed rawHeader) checkNoB64() error {
+	if _, ok := parsed[headerB64]; ok {
+		return ErrUnsupportedCriticalHeader
+	}
+
+	return nil
+}
+
+// errInvalidB64Value is returned when the "b64" header parameter is present
+// but is not a JSON boolean.
+var errInvalidB64Value = errors.New("go-jose/go-jose: invalid b64 header parameter")
+
+// checkB64Value verifies that a "b64" header parameter, when present, holds a
+// JSON boolean. RFC 7797 section 3 defines the value as a JSON boolean with a
+// default of true; any other JSON type, including null, must not be silently
+// treated as true, because the signer and verifier would then disagree about
+// the payload representation.
+func (parsed rawHeader) checkB64Value() error {
+	v, ok := parsed[headerB64]
+	if !ok {
+		return nil
+	}
+	if v == nil {
+		return errInvalidB64Value
+	}
+
+	switch strings.TrimSpace(string(*v)) {
+	case "true", "false":
+		return nil
+	default:
+		return errInvalidB64Value
+	}
+}
+
 // checkSupportedCritical verifies there are no unsupported critical headers.
-// Supported headers are passed in as a set: map of names to empty structs
+// Supported headers are passed in as a set: map of names to empty structs.
+//
+// Each name listed in "crit" must also occur in this same header: RFC 7515
+// section 4.1.11 requires every "crit" entry to name a Header Parameter of the
+// JOSE Header, and the parameter must be integrity protected, which is only
+// true for the protected header.
 func (parsed rawHeader) checkSupportedCritical(supported map[string]struct{}) error {
 	crit, err := parsed.getCritical()
 	if err != nil {
@@ -366,6 +408,9 @@ func (parsed rawHeader) checkSupportedCritical(supported map[string]struct{}) er
 
 	for _, name := range crit {
 		if _, ok := supported[name]; !ok {
+			return ErrUnsupportedCriticalHeader
+		}
+		if v, ok := parsed[HeaderKey(name)]; !ok || v == nil {
 			return ErrUnsupportedCriticalHeader
 		}
 	}
