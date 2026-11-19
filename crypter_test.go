@@ -18,6 +18,7 @@ package jose
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -863,6 +864,10 @@ func generateTestKeys(keyAlg KeyAlgorithm, encAlg ContentEncryption) []testKey {
 	case DIRECT:
 		return symmetricTestKey(getContentCipher(encAlg).keySize())
 	case ECDH_ES, ECDH_ES_A128KW, ECDH_ES_A192KW, ECDH_ES_A256KW:
+		x25519Key, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			panic(err)
+		}
 		return []testKey{
 			{
 				dec: ecTestKey256,
@@ -879,6 +884,15 @@ func generateTestKeys(keyAlg KeyAlgorithm, encAlg ContentEncryption) []testKey {
 			{
 				dec: &JSONWebKey{KeyID: "test", Key: ecTestKey256},
 				enc: &JSONWebKey{KeyID: "test", Key: &ecTestKey256.PublicKey},
+			},
+			{
+				// X25519 (RFC 8037), both as raw keys and via JWK.
+				dec: x25519Key,
+				enc: x25519Key.PublicKey(),
+			},
+			{
+				dec: &JSONWebKey{KeyID: "test", Key: x25519Key},
+				enc: &JSONWebKey{KeyID: "test", Key: x25519Key.PublicKey()},
 			},
 		}
 	case A128GCMKW, A128KW:

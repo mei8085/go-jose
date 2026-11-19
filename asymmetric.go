@@ -19,6 +19,7 @@ package jose
 import (
 	"crypto"
 	"crypto/aes"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -49,6 +50,11 @@ type ecEncrypterVerifier struct {
 	publicKey *ecdsa.PublicKey
 }
 
+// An X25519-based encrypter (RFC 8037), used for ECDH-ES key agreement.
+type x25519Encrypter struct {
+	publicKey *ecdh.PublicKey
+}
+
 type edEncrypterVerifier struct {
 	publicKey ed25519.PublicKey
 }
@@ -60,9 +66,21 @@ type ecKeyGenerator struct {
 	publicKey *ecdsa.PublicKey
 }
 
+// A key generator for ECDH-ES over X25519 (RFC 8037).
+type x25519KeyGenerator struct {
+	size      int
+	algID     string
+	publicKey *ecdh.PublicKey
+}
+
 // A generic EC-based decrypter/signer
 type ecDecrypterSigner struct {
 	privateKey *ecdsa.PrivateKey
+}
+
+// An X25519-based decrypter (RFC 8037), used for ECDH-ES key agreement.
+type x25519Decrypter struct {
+	privateKey *ecdh.PrivateKey
 }
 
 type edDecrypterSigner struct {
@@ -149,6 +167,30 @@ func newECDHRecipient(keyAlg KeyAlgorithm, publicKey *ecdsa.PublicKey) (recipien
 	return recipientKeyInfo{
 		keyAlg: keyAlg,
 		keyEncrypter: &ecEncrypterVerifier{
+			publicKey: publicKey,
+		},
+	}, nil
+}
+
+// newX25519Recipient creates recipientKeyInfo for ECDH-ES over X25519
+// (RFC 8037) based on the given key.
+func newX25519Recipient(keyAlg KeyAlgorithm, publicKey *ecdh.PublicKey) (recipientKeyInfo, error) {
+	switch keyAlg {
+	case ECDH_ES, ECDH_ES_A128KW, ECDH_ES_A192KW, ECDH_ES_A256KW:
+	default:
+		return recipientKeyInfo{}, ErrUnsupportedAlgorithm
+	}
+
+	if publicKey == nil || publicKey.Curve() != ecdh.X25519() {
+		return recipientKeyInfo{}, errors.New("invalid public key")
+	}
+	if err := validateX25519PublicKey(publicKey); err != nil {
+		return recipientKeyInfo{}, err
+	}
+
+	return recipientKeyInfo{
+		keyAlg: keyAlg,
+		keyEncrypter: &x25519Encrypter{
 			publicKey: publicKey,
 		},
 	}, nil
@@ -339,32 +381,46 @@ func (ctx rsaEncrypterVerifier) verifyPayload(payload []byte, signature []byte, 
 
 // Encrypt the given payload and update the object.
 func (ctx ecEncrypterVerifier) encryptKey(cek []byte, alg KeyAlgorithm) (recipientInfo, error) {
+	return encryptECDHESKey(cek, alg, func(size int) keyGenerator {
+		return ecKeyGenerator{size: size, algID: string(alg), publicKey: ctx.publicKey}
+	})
+}
+
+// Encrypt the given payload and update the object, using X25519 for ECDH-ES
+// key agreement (RFC 8037).
+func (ctx x25519Encrypter) encryptKey(cek []byte, alg KeyAlgorithm) (recipientInfo, error) {
+	return encryptECDHESKey(cek, alg, func(size int) keyGenerator {
+		return x25519KeyGenerator{size: size, algID: string(alg), publicKey: ctx.publicKey}
+	})
+}
+
+// encryptECDHESKey applies the key-management half of ECDH-ES for a single
+// recipient. In direct key agreement mode no key is wrapped; in the key
+// wrapping modes a KEK of the size implied by alg is derived and used with
+// AES Key Wrap.
+//
+// newGenerator builds the curve-specific generator, which must already carry
+// the recipient public key and the algorithm identifier, for the given KEK
+// size.
+func encryptECDHESKey(cek []byte, alg KeyAlgorithm, newGenerator func(size int) keyGenerator) (recipientInfo, error) {
+	var size int
 	switch alg {
 	case ECDH_ES:
 		// ECDH-ES mode doesn't wrap a key, the shared secret is used directly as the key.
 		return recipientInfo{
 			header: &rawHeader{},
 		}, nil
-	case ECDH_ES_A128KW, ECDH_ES_A192KW, ECDH_ES_A256KW:
+	case ECDH_ES_A128KW:
+		size = 16
+	case ECDH_ES_A192KW:
+		size = 24
+	case ECDH_ES_A256KW:
+		size = 32
 	default:
 		return recipientInfo{}, ErrUnsupportedAlgorithm
 	}
 
-	generator := ecKeyGenerator{
-		algID:     string(alg),
-		publicKey: ctx.publicKey,
-	}
-
-	switch alg {
-	case ECDH_ES_A128KW:
-		generator.size = 16
-	case ECDH_ES_A192KW:
-		generator.size = 24
-	case ECDH_ES_A256KW:
-		generator.size = 32
-	}
-
-	kek, header, err := generator.genKey()
+	kek, header, err := newGenerator(size).genKey()
 	if err != nil {
 		return recipientInfo{}, err
 	}
@@ -413,6 +469,37 @@ func (ctx ecKeyGenerator) genKey() ([]byte, rawHeader, error) {
 	return out, headers, nil
 }
 
+// Get key size for the X25519 key generator
+func (ctx x25519KeyGenerator) keySize() int {
+	return ctx.size
+}
+
+// Get a content encryption key for ECDH-ES over X25519 (RFC 8037).
+func (ctx x25519KeyGenerator) genKey() ([]byte, rawHeader, error) {
+	priv, err := ecdh.X25519().GenerateKey(randReader)
+	if err != nil {
+		return nil, rawHeader{}, err
+	}
+
+	out, err := josecipher.DeriveECDHESX25519(ctx.algID, []byte{}, []byte{}, priv, ctx.publicKey, ctx.size)
+	if err != nil {
+		return nil, rawHeader{}, err
+	}
+
+	b, err := json.Marshal(&JSONWebKey{
+		Key: priv.PublicKey(),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	headers := rawHeader{
+		headerEPK: makeRawMessage(b),
+	}
+
+	return out, headers, nil
+}
+
 // Decrypt the given payload and return the content encryption key.
 func (ctx ecDecrypterSigner) decryptKey(headers rawHeader, recipient *recipientInfo, generator keyGenerator) ([]byte, error) {
 	if recipient == nil {
@@ -444,25 +531,39 @@ func (ctx ecDecrypterSigner) decryptKey(headers rawHeader, recipient *recipientI
 		return nil, errors.New("go-jose/go-jose: invalid apv header")
 	}
 
-	deriveKey := func(algID string, size int) []byte {
-		return josecipher.DeriveECDHES(algID, apuData.bytes(), apvData.bytes(), ctx.privateKey, publicKey, size)
+	deriveKey := func(algID string, size int) ([]byte, error) {
+		return josecipher.DeriveECDHES(algID, apuData.bytes(), apvData.bytes(), ctx.privateKey, publicKey, size), nil
 	}
 
-	var keySize int
+	return unwrapECDHESKey(headers, recipient, generator, deriveKey)
+}
 
+// unwrapECDHESKey applies the key-management half of ECDH-ES to the derived
+// KEK: in direct key agreement mode the KEK - derived from the content
+// encryption algorithm identifier and its key size - is the CEK, and in the
+// key-wrapping modes the KEK unwraps the JWE Encrypted Key.
+//
+// It is shared by the NIST-curve and X25519 decrypters so that both exhibit
+// identical mode selection, key sizes and error semantics.
+func unwrapECDHESKey(headers rawHeader, recipient *recipientInfo, generator keyGenerator, deriveKey func(algID string, size int) ([]byte, error)) ([]byte, error) {
 	algorithm := headers.getAlgorithm()
 	switch algorithm {
 	case ECDH_ES:
 		// ECDH-ES uses direct key agreement, no key unwrapping necessary.
-		return deriveKey(string(headers.getEncryption()), generator.keySize()), nil
+		return deriveKey(string(headers.getEncryption()), generator.keySize())
+	case ECDH_ES_A128KW, ECDH_ES_A192KW, ECDH_ES_A256KW:
+	default:
+		return nil, ErrUnsupportedAlgorithm
+	}
+
+	var keySize int
+	switch algorithm {
 	case ECDH_ES_A128KW:
 		keySize = 16
 	case ECDH_ES_A192KW:
 		keySize = 24
 	case ECDH_ES_A256KW:
 		keySize = 32
-	default:
-		return nil, ErrUnsupportedAlgorithm
 	}
 
 	encryptedKey := recipient.encryptedKey
@@ -470,13 +571,57 @@ func (ctx ecDecrypterSigner) decryptKey(headers rawHeader, recipient *recipientI
 		return nil, errors.New("go-jose/go-jose: missing JWE Encrypted Key")
 	}
 
-	key := deriveKey(string(algorithm), keySize)
+	key, err := deriveKey(string(algorithm), keySize)
+	if err != nil {
+		return nil, err
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
 
 	return josecipher.KeyUnwrap(block, encryptedKey)
+}
+
+// Decrypt the given payload and return the content encryption key, using X25519
+// for ECDH-ES key agreement (RFC 8037).
+func (ctx x25519Decrypter) decryptKey(headers rawHeader, recipient *recipientInfo, generator keyGenerator) ([]byte, error) {
+	if recipient == nil {
+		return nil, errors.New("go-jose/go-jose: missing recipient")
+	}
+	epk, err := headers.getEPK()
+	if err != nil {
+		return nil, errors.New("go-jose/go-jose: invalid epk header")
+	}
+	if epk == nil {
+		return nil, errors.New("go-jose/go-jose: missing epk header")
+	}
+
+	publicKey, ok := epk.Key.(*ecdh.PublicKey)
+	if publicKey == nil || !ok || publicKey.Curve() != ecdh.X25519() {
+		return nil, errors.New("go-jose/go-jose: invalid epk header")
+	}
+
+	// The ephemeral key and the recipient's private key must use the same
+	// curve; reject a mismatch before doing any key agreement.
+	if ctx.privateKey == nil || ctx.privateKey.Curve() != publicKey.Curve() {
+		return nil, errors.New("go-jose/go-jose: invalid epk header")
+	}
+
+	apuData, err := headers.getAPU()
+	if err != nil {
+		return nil, errors.New("go-jose/go-jose: invalid apu header")
+	}
+	apvData, err := headers.getAPV()
+	if err != nil {
+		return nil, errors.New("go-jose/go-jose: invalid apv header")
+	}
+
+	deriveKey := func(algID string, size int) ([]byte, error) {
+		return josecipher.DeriveECDHESX25519(algID, apuData.bytes(), apvData.bytes(), ctx.privateKey, publicKey, size)
+	}
+
+	return unwrapECDHESKey(headers, recipient, generator, deriveKey)
 }
 
 func (ctx edDecrypterSigner) signPayload(payload []byte, alg SignatureAlgorithm) (Signature, error) {

@@ -17,6 +17,7 @@
 package jose
 
 import (
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"errors"
@@ -124,6 +125,7 @@ type Recipient struct {
 	// Key must have one of these types:
 	//  - ed25519.PublicKey
 	//  - *ecdsa.PublicKey
+	//  - *ecdh.PublicKey (an X25519 key, per RFC 8037)
 	//  - *rsa.PublicKey
 	//  - *JSONWebKey
 	//  - JSONWebKey
@@ -188,22 +190,42 @@ func NewEncrypter(enc ContentEncryption, rcpt Recipient, opts *EncrypterOptions)
 		return encrypter, nil
 	case ECDH_ES:
 		// ECDH-ES (w/o key wrapping) is similar to DIRECT mode
-		keyDSA, ok := rawKey.(*ecdsa.PublicKey)
-		if !ok {
+		switch keyDSA := rawKey.(type) {
+		case *ecdsa.PublicKey:
+			encrypter.keyGenerator = ecKeyGenerator{
+				size:      encrypter.cipher.keySize(),
+				algID:     string(enc),
+				publicKey: keyDSA,
+			}
+			recipientInfo, _ := newECDHRecipient(rcpt.Algorithm, keyDSA)
+			recipientInfo.keyID = keyID
+			if rcpt.KeyID != "" {
+				recipientInfo.keyID = rcpt.KeyID
+			}
+			encrypter.recipients = []recipientKeyInfo{recipientInfo}
+			return encrypter, nil
+		case *ecdh.PublicKey:
+			if keyDSA.Curve() != ecdh.X25519() {
+				return nil, ErrUnsupportedKeyType
+			}
+			recipientInfo, err := newX25519Recipient(rcpt.Algorithm, keyDSA)
+			if err != nil {
+				return nil, err
+			}
+			encrypter.keyGenerator = x25519KeyGenerator{
+				size:      encrypter.cipher.keySize(),
+				algID:     string(enc),
+				publicKey: keyDSA,
+			}
+			recipientInfo.keyID = keyID
+			if rcpt.KeyID != "" {
+				recipientInfo.keyID = rcpt.KeyID
+			}
+			encrypter.recipients = []recipientKeyInfo{recipientInfo}
+			return encrypter, nil
+		default:
 			return nil, ErrUnsupportedKeyType
 		}
-		encrypter.keyGenerator = ecKeyGenerator{
-			size:      encrypter.cipher.keySize(),
-			algID:     string(enc),
-			publicKey: keyDSA,
-		}
-		recipientInfo, _ := newECDHRecipient(rcpt.Algorithm, keyDSA)
-		recipientInfo.keyID = keyID
-		if rcpt.KeyID != "" {
-			recipientInfo.keyID = rcpt.KeyID
-		}
-		encrypter.recipients = []recipientKeyInfo{recipientInfo}
-		return encrypter, nil
 	default:
 		// Can just add a standard recipient
 		encrypter.keyGenerator = randomKeyGenerator{
@@ -284,6 +306,8 @@ func makeJWERecipient(alg KeyAlgorithm, encryptionKey interface{}) (recipientKey
 		return newRSARecipient(alg, encryptionKey)
 	case *ecdsa.PublicKey:
 		return newECDHRecipient(alg, encryptionKey)
+	case *ecdh.PublicKey:
+		return newX25519Recipient(alg, encryptionKey)
 	case []byte:
 		return newSymmetricRecipient(alg, encryptionKey)
 	case string:
@@ -311,6 +335,13 @@ func newDecrypter(decryptionKey interface{}) (keyDecrypter, error) {
 		}, nil
 	case *ecdsa.PrivateKey:
 		return &ecDecrypterSigner{
+			privateKey: decryptionKey,
+		}, nil
+	case *ecdh.PrivateKey:
+		if decryptionKey.Curve() != ecdh.X25519() {
+			return nil, ErrUnsupportedKeyType
+		}
+		return &x25519Decrypter{
 			privateKey: decryptionKey,
 		}, nil
 	case []byte:
@@ -445,6 +476,7 @@ func validateContentEncryptionKeySize(cek []byte, cipher contentCipher) error {
 // The decryptionKey argument must contain a private or symmetric key
 // and must have one of these types:
 //   - *ecdsa.PrivateKey
+//   - *ecdh.PrivateKey (an X25519 key, per RFC 8037)
 //   - *rsa.PrivateKey
 //   - *JSONWebKey
 //   - JSONWebKey

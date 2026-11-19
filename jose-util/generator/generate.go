@@ -18,6 +18,7 @@ package generator
 
 import (
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -28,6 +29,10 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 )
+
+// x25519KeySize is the nominal size of an X25519 key in bits, accepted by
+// NewEncryptionKey via the -size flag.
+const x25519KeySize = 255
 
 // NewSigningKey generates a keypair for corresponding SignatureAlgorithm.
 func NewSigningKey(alg jose.SignatureAlgorithm, bits int) (crypto.PublicKey, crypto.PrivateKey, error) {
@@ -102,6 +107,13 @@ func NewEncryptionKey(alg jose.KeyAlgorithm, bits int) (crypto.PublicKey, crypto
 		}
 		return key.Public(), key, err
 	case jose.ECDH_ES, jose.ECDH_ES_A128KW, jose.ECDH_ES_A192KW, jose.ECDH_ES_A256KW:
+		if bits == x25519KeySize {
+			key, err := ecdh.X25519().GenerateKey(rand.Reader)
+			if err != nil {
+				return nil, nil, err
+			}
+			return key.PublicKey(), key, nil
+		}
 		var crv elliptic.Curve
 		switch bits {
 		case 0, 256:
@@ -111,7 +123,7 @@ func NewEncryptionKey(alg jose.KeyAlgorithm, bits int) (crypto.PublicKey, crypto
 		case 521:
 			crv = elliptic.P521()
 		default:
-			return nil, nil, errors.New("invalid elliptic curve key size, use one of 256, 384, or 521")
+			return nil, nil, errors.New("invalid elliptic curve key size, use one of 256, 384, 521 or 255 (X25519)")
 		}
 		key, err := ecdsa.GenerateKey(crv, rand.Reader)
 		if err != nil {

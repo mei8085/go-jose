@@ -19,6 +19,7 @@ package jose
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -82,6 +83,8 @@ type JSONWebKey struct {
 	//  - ed25519.PrivateKey
 	//  - *ecdsa.PublicKey
 	//  - *ecdsa.PrivateKey
+	//  - *ecdh.PublicKey (an X25519 key, per RFC 8037)
+	//  - *ecdh.PrivateKey (an X25519 key, per RFC 8037)
 	//  - *rsa.PublicKey
 	//  - *rsa.PrivateKey
 	//  - []byte (a symmetric key)
@@ -116,12 +119,16 @@ func (k JSONWebKey) MarshalJSON() ([]byte, error) {
 		raw, err = fromEdPublicKey(key)
 	case *ecdsa.PublicKey:
 		raw, err = fromEcPublicKey(key)
+	case *ecdh.PublicKey:
+		raw, err = fromX25519PublicKey(key)
 	case *rsa.PublicKey:
 		raw = fromRsaPublicKey(key)
 	case ed25519.PrivateKey:
 		raw, err = fromEdPrivateKey(key)
 	case *ecdsa.PrivateKey:
 		raw, err = fromEcPrivateKey(key)
+	case *ecdh.PrivateKey:
+		raw, err = fromX25519PrivateKey(key)
 	case *rsa.PrivateKey:
 		raw, err = fromRsaPrivateKey(key)
 	case []byte:
@@ -277,7 +284,8 @@ func (k *JSONWebKey) unmarshalJSON(data []byte, allowPrivate bool) (err error) {
 			return err
 		}
 	case "OKP":
-		if raw.Crv == "Ed25519" {
+		switch raw.Crv {
+		case "Ed25519":
 			if raw.D != nil {
 				key, err = raw.edPrivateKey()
 				if err != nil {
@@ -286,6 +294,20 @@ func (k *JSONWebKey) unmarshalJSON(data []byte, allowPrivate bool) (err error) {
 				keyPub = key.(ed25519.PrivateKey).Public()
 			} else {
 				key, err = raw.edPublicKey()
+				if err != nil {
+					return err
+				}
+				keyPub = key
+			}
+		case "X25519":
+			if raw.D != nil {
+				key, err = raw.x25519PrivateKey()
+				if err != nil {
+					return err
+				}
+				keyPub = key.(*ecdh.PrivateKey).PublicKey()
+			} else {
+				key, err = raw.x25519PublicKey()
 				if err != nil {
 					return err
 				}
@@ -452,6 +474,15 @@ func edThumbprintInput(ed ed25519.PublicKey) (string, error) {
 		newFixedSizeBuffer(ed, ed25519.PublicKeySize).base64()), nil
 }
 
+func x25519ThumbprintInput(pub *ecdh.PublicKey) (string, error) {
+	err := validateX25519PublicKey(pub)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(edThumbprintTemplate, "X25519",
+		newFixedSizeBuffer(pub.Bytes(), x25519PublicKeySize).base64()), nil
+}
+
 // Thumbprint computes the JWK Thumbprint of a key using the
 // indicated hash algorithm.
 func (k *JSONWebKey) Thumbprint(hash crypto.Hash) ([]byte, error) {
@@ -464,6 +495,10 @@ func (k *JSONWebKey) Thumbprint(hash crypto.Hash) ([]byte, error) {
 		input, err = ecThumbprintInput(key.Curve, key.X, key.Y)
 	case *ecdsa.PrivateKey:
 		input, err = ecThumbprintInput(key.Curve, key.X, key.Y)
+	case *ecdh.PublicKey:
+		input, err = x25519ThumbprintInput(key)
+	case *ecdh.PrivateKey:
+		input, err = x25519ThumbprintInput(key.PublicKey())
 	case *rsa.PublicKey:
 		input, err = rsaThumbprintInput(key.N, key.E)
 	case *rsa.PrivateKey:
@@ -492,7 +527,7 @@ func (k *JSONWebKey) Thumbprint(hash crypto.Hash) ([]byte, error) {
 // IsPublic returns true if the JWK represents a public key (not symmetric, not private).
 func (k *JSONWebKey) IsPublic() bool {
 	switch k.Key.(type) {
-	case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
+	case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey, *ecdh.PublicKey:
 		return true
 	default:
 		return mldsaIsPublic(k.Key)
@@ -512,6 +547,8 @@ func (k *JSONWebKey) Public() JSONWebKey {
 		ret.Key = key.Public()
 	case ed25519.PrivateKey:
 		ret.Key = key.Public()
+	case *ecdh.PrivateKey:
+		ret.Key = key.PublicKey()
 	default:
 		pub, ok := mldsaPublicOf(k.Key)
 		if !ok {
@@ -550,6 +587,14 @@ func (k *JSONWebKey) Valid() bool {
 		}
 	case ed25519.PrivateKey:
 		if len(key) != 64 {
+			return false
+		}
+	case *ecdh.PublicKey:
+		if key == nil || key.Curve() != ecdh.X25519() || len(key.Bytes()) != x25519PublicKeySize {
+			return false
+		}
+	case *ecdh.PrivateKey:
+		if key == nil || key.Curve() != ecdh.X25519() || len(key.Bytes()) != x25519PrivateKeySize {
 			return false
 		}
 	default:
@@ -732,6 +777,55 @@ func (key rawJSONWebKey) edPublicKey() (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(bytes.Clone(publicKey)), nil
 }
 
+// x25519PublicKey parses the "x" member of an RFC 8037 OKP JWK as an X25519
+// public key (the 32-byte u-coordinate).
+func (key rawJSONWebKey) x25519PublicKey() (*ecdh.PublicKey, error) {
+	if key.X == nil {
+		return nil, fmt.Errorf("go-jose/go-jose: invalid X25519 key, missing x value")
+	}
+	publicKey, err := ecdh.X25519().NewPublicKey(key.X.bytes())
+	if err != nil {
+		return nil, fmt.Errorf("go-jose/go-jose: invalid X25519 public key, wrong length for x")
+	}
+	if err := validateX25519PublicKey(publicKey); err != nil {
+		return nil, err
+	}
+	return publicKey, nil
+}
+
+// x25519PrivateKey parses an RFC 8037 X25519 private JWK. The "d" member holds
+// the 32-byte private scalar; the "x" member, when present, must be the public
+// key derived from it.
+func (key rawJSONWebKey) x25519PrivateKey() (*ecdh.PrivateKey, error) {
+	var missing []string
+	if key.D == nil {
+		missing = append(missing, "D")
+	}
+	if key.X == nil {
+		missing = append(missing, "X")
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("go-jose/go-jose: invalid X25519 private key, missing %s value(s)", strings.Join(missing, ", "))
+	}
+
+	privateKey, err := ecdh.X25519().NewPrivateKey(key.D.bytes())
+	if err != nil {
+		return nil, fmt.Errorf("go-jose/go-jose: invalid X25519 private key, wrong length for d")
+	}
+
+	publicKey, err := key.x25519PublicKey()
+	if err != nil {
+		return nil, err
+	}
+
+	expected := privateKey.PublicKey()
+	if !bytes.Equal(expected.Bytes(), publicKey.Bytes()) {
+		return nil, errors.New("go-jose/go-jose: invalid X25519 private key, x does not match d")
+	}
+
+	return privateKey, nil
+}
+
 func (key rawJSONWebKey) rsaPrivateKey() (*rsa.PrivateKey, error) {
 	var missing []string
 	if key.N == nil {
@@ -796,6 +890,33 @@ func fromEdPrivateKey(ed ed25519.PrivateKey) (*rawJSONWebKey, error) {
 	}
 
 	raw.D = newBuffer(ed.Seed())
+	return raw, nil
+}
+
+// fromX25519PublicKey serializes an X25519 public key as an RFC 8037 OKP JWK.
+func fromX25519PublicKey(pub *ecdh.PublicKey) (*rawJSONWebKey, error) {
+	if err := validateX25519PublicKey(pub); err != nil {
+		return nil, err
+	}
+	return &rawJSONWebKey{
+		Kty: "OKP",
+		Crv: "X25519",
+		X:   newBuffer(pub.Bytes()),
+	}, nil
+}
+
+// fromX25519PrivateKey serializes an X25519 private key as an RFC 8037 OKP JWK.
+func fromX25519PrivateKey(priv *ecdh.PrivateKey) (*rawJSONWebKey, error) {
+	if priv == nil || priv.Curve() != ecdh.X25519() || len(priv.Bytes()) != x25519PrivateKeySize {
+		return nil, errors.New("go-jose/go-jose: invalid X25519 private key")
+	}
+
+	raw, err := fromX25519PublicKey(priv.PublicKey())
+	if err != nil {
+		return nil, err
+	}
+
+	raw.D = newBuffer(priv.Bytes())
 	return raw, nil
 }
 
@@ -934,6 +1055,14 @@ var (
 	ErrJWKSKidNotFound = errors.New("go-jose/go-jose: JWK with matching kid not found in JWK Set")
 )
 
+const (
+	// x25519PublicKeySize is the size in bytes of an X25519 public key, which
+	// is the encoded u-coordinate (RFC 7748, Section 5).
+	x25519PublicKeySize = 32
+	// x25519PrivateKeySize is the size in bytes of an X25519 private key.
+	x25519PrivateKeySize = 32
+)
+
 func tryJWKS(key interface{}, header Header) (interface{}, error) {
 	var jwks JSONWebKeySet
 
@@ -1062,6 +1191,39 @@ func validateEd25519PublicKey(publicKey ed25519.PublicKey) error {
 	_, ok := weakEd25519PublicKeys[encoded]
 	if ok {
 		return errors.New("go-jose/go-jose: invalid Ed25519 public key, low-order point")
+	}
+
+	return nil
+}
+
+// x25519LowOrderProbe is an arbitrary, fixed X25519 private key used to detect
+// low-order public keys. ECDH with a small-order point yields an all-zero
+// shared secret irrespective of the private key, which crypto/ecdh reports as
+// an error, so probing with this key reliably identifies such points.
+var x25519LowOrderProbe = func() *ecdh.PrivateKey {
+	key, err := ecdh.X25519().NewPrivateKey(bytes.Repeat([]byte{0x42}, x25519PrivateKeySize))
+	if err != nil {
+		panic("go-jose/go-jose: failed to build X25519 low-order probe key")
+	}
+	return key
+}()
+
+// validateX25519PublicKey checks that pub is a well-formed X25519 public key
+// that is not a small-order point. ECDH against any small-order point produces
+// an all-zero shared secret regardless of the private key, so such keys must
+// never be accepted from untrusted input.
+func validateX25519PublicKey(pub *ecdh.PublicKey) error {
+	if pub == nil || pub.Curve() != ecdh.X25519() {
+		return errors.New("go-jose/go-jose: invalid X25519 public key")
+	}
+	if len(pub.Bytes()) != x25519PublicKeySize {
+		return errors.New("go-jose/go-jose: invalid X25519 public key, wrong length for x")
+	}
+
+	// crypto/ecdh rejects an all-zero ECDH output, which is exactly the
+	// low-order-point condition. Any other failure is also treated as invalid.
+	if _, err := x25519LowOrderProbe.ECDH(pub); err != nil {
+		return errors.New("go-jose/go-jose: invalid X25519 public key, low-order point")
 	}
 
 	return nil

@@ -55,11 +55,13 @@ standard where possible. The Godoc reference has a list of constants.
 | RSA-OAEP               | RSA-OAEP, RSA-OAEP-256                         |
 | AES key wrap           | A128KW, A192KW, A256KW                         |
 | AES-GCM key wrap       | A128GCMKW, A192GCMKW, A256GCMKW                |
-| ECDH-ES + AES key wrap | ECDH-ES+A128KW, ECDH-ES+A192KW, ECDH-ES+A256KW |
-| ECDH-ES (direct)       | ECDH-ES<sup>1</sup>                            |
+| ECDH-ES + AES key wrap | ECDH-ES+A128KW, ECDH-ES+A192KW, ECDH-ES+A256KW<sup>2</sup> |
+| ECDH-ES (direct)       | ECDH-ES<sup>1,2</sup>                          |
 | Direct encryption      | dir<sup>1</sup>                                |
 
 <sup>1. Not supported in multi-recipient mode</sup>
+
+<sup>2. Supports both NIST curves (P-256, P-384, P-521) and, per RFC 8037, X25519</sup>
 
 | Signing / MAC     | Algorithm identifier(s)                     |
 |:------------------|:--------------------------------------------|
@@ -94,6 +96,7 @@ allows attaching a key id.
 |:-------------------|--------------------------------------------------------------------------------------------------------------------------------------|
 | RSA                | *[rsa.PublicKey](https://pkg.go.dev/crypto/rsa/#PublicKey), *[rsa.PrivateKey](https://pkg.go.dev/crypto/rsa/#PrivateKey)             |
 | ECDH, ECDSA        | *[ecdsa.PublicKey](https://pkg.go.dev/crypto/ecdsa/#PublicKey), *[ecdsa.PrivateKey](https://pkg.go.dev/crypto/ecdsa/#PrivateKey)     |
+| ECDH (X25519)      | *[ecdh.PublicKey](https://pkg.go.dev/crypto/ecdh/#PublicKey), *[ecdh.PrivateKey](https://pkg.go.dev/crypto/ecdh/#PrivateKey)<sup>3</sup> |
 | EdDSA<sup>1</sup>  | [ed25519.PublicKey](https://pkg.go.dev/crypto/ed25519#PublicKey), [ed25519.PrivateKey](https://pkg.go.dev/crypto/ed25519#PrivateKey) |
 | ML-DSA<sup>2</sup> | *[mldsa.PublicKey](https://pkg.go.dev/crypto/mldsa#PublicKey), *[mldsa.PrivateKey](https://pkg.go.dev/crypto/mldsa#PrivateKey)       |
 | AES, HMAC          | []byte                                                                                                                               |
@@ -101,6 +104,8 @@ allows attaching a key id.
 <sup>1. Only available in version 2 or later of the package</sup>
 
 <sup>2. Requires Go 1.27 or later</sup>
+
+<sup>3. Only the X25519 curve is supported (RFC 8037); keys are exchanged in JWK form as "kty":"OKP", "crv":"X25519"</sup>
 
 ## Examples
 

@@ -17,6 +17,7 @@
 package jose
 
 import (
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
@@ -70,7 +71,7 @@ func newOpaqueSigner(alg SignatureAlgorithm, signer OpaqueSigner) (recipientSigI
 // OpaqueSigner may use a key type that go-jose does not know about.
 func isKnownPrivateKeyType(key any) bool {
 	switch key.(type) {
-	case *ecdsa.PrivateKey, *rsa.PrivateKey, ed25519.PrivateKey:
+	case *ecdsa.PrivateKey, *rsa.PrivateKey, ed25519.PrivateKey, *ecdh.PrivateKey:
 		return true
 	default:
 		_, ok := mldsaPublicOf(key)
